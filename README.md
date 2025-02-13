@@ -244,6 +244,11 @@ Generate YAML
 
     Click the Generate YAML button.
     Download the generated camera_config.yaml file.
+### Install Open3D (from Source for Jetson Orin only)
+Use this repository and follow the instructions due to CUDA problems for ARM Chips:
+```
+https://github.com/henryrobbins/Open3D/tree/jetson-orin-nano
+```
 ### Install requirements for the mapping module
 
 ```
