@@ -20,7 +20,6 @@ import nvidia_smi
 
 
 
-
 gpu_memory_usage = []
 
 def get_gpu_memory_usage():
@@ -125,7 +124,7 @@ def get_indices_from_points(voxel_grid,points,res = 8,voxel_size = 0.025,device 
 
 class Reconstruction:
 
-    def __init__(self,depth_scale = 1000.0,depth_max=5.0,res = 8,voxel_size = 0.025,trunc_multiplier = 8,n_labels = None,integrate_color = True,device = o3d.core.Device('CPU:0'),miu = 0.001):
+    def __init__(self,depth_scale = 1000.0,depth_max=5.0,res = 8,voxel_size = 0.025,trunc_multiplier = 8,n_labels = None,integrate_color = True,device = o3d.core.Device('CUDA:0'),miu = 0.001, init_blocks=17500, live_stream=False):
         """Initializes the TSDF reconstruction pipeline using voxel block grids, ideally using a GPU device for efficiency. 
 
         Args:
@@ -148,6 +147,10 @@ class Reconstruction:
         self.semantic_integration = self.n_labels is not None
         self.miu = miu
         self.trunc = self.voxel_size * trunc_multiplier
+        self.init_blocks = init_blocks
+        self._updated_blocks = set()
+        self.live_stream=live_stream
+
         try:
             self.initialize_vbg()
         except Exception as e:
@@ -174,23 +177,23 @@ class Reconstruction:
             self.vbg = o3d.t.geometry.VoxelBlockGrid(
             ('tsdf', 'weight', 'color'),
             (o3c.float32, o3c.float32, o3c.float32), ((1), (1), (3)),
-            self.voxel_size,self.res, 20000, self.device)
+            self.voxel_size,self.res, self.init_blocks, self.device)
         elif((self.integrate_color == False) and (self.n_labels is not None)):
             self.vbg = o3d.t.geometry.VoxelBlockGrid(
             ('tsdf', 'weight', 'label'),
             (o3c.float32, o3c.float32, o3c.float32), ((1), (1), (self.n_labels)),
-            self.voxel_size,self.res, 20000, self.device)
+            self.voxel_size,self.res, self.init_blocks, self.device)
         elif((self.integrate_color) and (self.n_labels is not None)):
             self.vbg = o3d.t.geometry.VoxelBlockGrid(
             ('tsdf', 'weight','color','label'),
             (o3c.float32, o3c.float32, o3c.float32,o3c.float32), ((1), (1),(3),(self.n_labels)),
-            self.voxel_size,self.res, 20000, self.device)
+            self.voxel_size,self.res, self.init_blocks, self.device)
         else:
             print('No color or Semantics')
             self.vbg = o3d.t.geometry.VoxelBlockGrid(
             ('tsdf', 'weight'),
             (o3c.float32, o3c.float32), ((1), (1)),
-            self.voxel_size,self.res, 20000, self.device)
+            self.voxel_size,self.res, self.init_blocks, self.device)
 
 
     def update_vbg(self,depth,intrinsic,pose,color = None,semantic_label = None, scene = None):
@@ -225,6 +228,10 @@ class Reconstruction:
         # Find buf indices in the underlying engine
         buf_indices, masks = self.vbg.hashmap().find(frustum_block_coords)
         # o3d.core.cuda.synchronize()
+        # after computing buf_indices (an o3d.core.Tensor on CUDA)
+        new_blocks = buf_indices.cpu().numpy().tolist()
+        self._updated_blocks.update(new_blocks)
+
         voxel_coords, voxel_indices = self.vbg.voxel_coordinates_and_flattened_indices(
             buf_indices)
         # o3d.core.cuda.synchronize()
@@ -290,6 +297,8 @@ class Reconstruction:
     def update_color(self,color,depth,valid_voxel_indices,mask_inlier,w,wp,v_proj,u_proj):
         #performing color integration
         color = cv2.resize(color,(depth.columns,depth.rows),interpolation= cv2.INTER_NEAREST)
+        color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
+        color = color.astype(np.float32) / 255.0
         color = o3d.t.geometry.Image(o3c.Tensor(color.astype(np.float32))).to(self.device)
         color_readings = color.as_tensor()[v_proj,u_proj].to(o3c.float32)
         color = self.vbg.attribute('color').reshape((-1, 3))
@@ -398,7 +407,7 @@ class Reconstruction:
         # Initialize unobserved voxels with uniform prior directly on GPU
         zero_weight_mask = weight[valid_voxel_indices].flatten() == 0
         if zero_weight_mask.any():
-            uniform_prior = torch.log(torch.tensor([1.0 / self.n_labels], dtype=torch.float32, device='cpu'))
+            uniform_prior = torch.log(torch.tensor([1.0 / self.n_labels], dtype=torch.float32, device='cuda'))
             semantic[valid_voxel_indices[zero_weight_mask]] += o3c.Tensor.from_dlpack(torch.utils.dlpack.to_dlpack(uniform_prior))
 
         # Bayesian update directly in log space on the GPU
@@ -454,20 +463,60 @@ class Reconstruction:
         pcd = pcd.to_legacy()
         sm = nn.Softmax(dim = 1)
         target_points = np.asarray(pcd.points)
-        if(self.semantic_integration):
+        if(self.integrate_color):
             colors,coords = get_properties(self.vbg,target_points,'color',res = self.res,voxel_size = self.voxel_size,device = self.device)
-            colors = colors.cpu().numpy().astype(np.float64)
+            try:
+                colors = colors.cpu().numpy().astype(np.float64)
+            except Exception as e:
+                print(e)
+
             if colors is not None:
                 if(return_raw_logits):
                     return pcd,colors
                 else:
                     colors = colors
-                    colors = sm(torch.from_numpy(colors)).numpy()
                     return pcd,colors
             else:
                 return None,None
         else:
             return pcd,None
+    
+
+    def extract_point_cloud_wcolor_diff_blocks(self, tsdf_thresh=0.01, return_color=True):
+        buf_ids = list(self._updated_blocks)
+        
+        if not buf_ids:
+            return np.empty((0,3)), (None if not return_color else np.empty((0,3)))
+        self._updated_blocks.clear()
+        print("Here1")
+        b = o3c.Tensor(np.array(buf_ids, dtype=np.int32), device=self.device)
+
+        coords, flat_idxs = self.vbg.voxel_coordinates_and_flattened_indices(b)
+        # coords: Tensor[B * res³, 3], flat_idxs: Tensor[B * res³]
+
+        tsdf_attr = self.vbg.attribute('tsdf').reshape(-1)
+        weight_attr = self.vbg.attribute('weight').reshape(-1)
+
+        tsdf_vals = tsdf_attr[flat_idxs]
+        weight_vals = weight_attr[flat_idxs]
+        print("Here2")
+        mask = (weight_vals > 0) & (tsdf_vals.abs() < tsdf_thresh)
+
+        coords_f     = coords[mask]                                # [K,3]
+        flat_idxs_f  = flat_idxs[mask]                             # [K]
+
+        pts = coords_f.cpu().numpy().reshape(-1, 3)
+        print("Here3")
+        cols = None
+        if return_color and self.integrate_color:
+            # color_attr = self.vbg.attribute('color').reshape(-1, 3) 
+            # sel_colors = color_attr[flat_idxs_f]                     # [K,3]
+            # cols = sel_colors.cpu().numpy().reshape(-1, 3)
+            color_vals, _ = get_properties(self.vbg, pts.astype(np.float32), 'color', res=self.res, voxel_size=self.voxel_size, device=self.device)
+            cols = color_vals.cpu().numpy().astype(np.float64)
+        print(pts.shape, cols)
+        return pts, cols
+
 
     def extract_triangle_mesh(self):
         """Returns the current (colored) mesh and the current probability for each class estimate for each of the vertices, if performing metric-semantic reconstruction
